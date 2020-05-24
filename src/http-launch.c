@@ -16,6 +16,10 @@
  * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
  * Boston, MA 02110-1301, USA.
  */
+
+// in ns
+#define DELAY 30000000000
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -48,10 +52,86 @@ G_LOCK_DEFINE_STATIC (clients);
 static GList *clients = NULL;
 static GstElement *pipeline = NULL;
 static GstElement *multisocketsink = NULL;
-static gboolean started = FALSE;
+//static gboolean started = FALSE;
 static gchar *content_type;
 G_LOCK_DEFINE_STATIC (caps);
 static gboolean caps_resolved = FALSE;
+
+static gboolean check_started(GstElement * pl) {
+  GstState pl_state;
+  gst_element_get_state (pl, &pl_state, NULL, GST_CLOCK_TIME_NONE);
+  if (pl_state != GST_STATE_PLAYING)
+    return FALSE;
+  return TRUE;
+}
+
+static gboolean switch_src(gpointer pl)
+{
+  gint nb_sources;
+  GstPad *active_pad, *new_pad;
+  gchar *active_name;
+  GstElement *src_switch;
+
+  if(!check_started(pl))
+    return FALSE;
+
+  src_switch = gst_bin_get_by_name (GST_BIN (pl), "mute");
+  if (!src_switch) {
+    g_print ("no element with name \"mute\" ?!\n");
+    return FALSE;
+  }
+
+  gint64 cur_time;
+  gst_element_query_position (pl, GST_FORMAT_TIME, &cur_time);
+  if (cur_time < DELAY) {
+    // not time to switch, maybe later..
+    return TRUE;
+  }
+
+  g_message ("switching");
+  g_object_get (G_OBJECT (src_switch), "n-pads", &nb_sources, NULL);
+  g_object_get (G_OBJECT (src_switch), "active-pad", &active_pad, NULL);
+
+  active_name = gst_pad_get_name (active_pad);
+  if (strcmp (active_name, "sink_0") == 0) {
+    new_pad = gst_element_get_static_pad (src_switch, "sink_1");
+  } else {
+    //new_pad = gst_element_get_static_pad (src_switch, "sink_0");
+    g_message("Already on sink 1\n");
+    g_free (active_name);
+    return FALSE;
+  }
+  g_object_set (G_OBJECT (src_switch), "active-pad", new_pad, NULL);
+  g_free (active_name);
+  gst_object_unref (new_pad);
+
+  g_message ("current number of sources : %d, active source %s",
+      nb_sources, gst_pad_get_name (active_pad));
+
+  // (GST_STATE (GST_ELEMENT (src_switch)) == GST_STATE_PLAYING);
+  return FALSE;
+
+}
+
+static gboolean pause_when_theres_noone(gpointer pl)
+{
+  /* Pause if no clients */
+  G_LOCK (clients);
+  gboolean is_empty = (clients == NULL);
+  G_UNLOCK (clients);
+  if (is_empty == TRUE) {
+    if (check_started(pl)) {
+      g_print ("Pausing pipeline\n");
+      if (gst_element_set_state (pl,
+              GST_STATE_READY) == GST_STATE_CHANGE_FAILURE) {
+        g_print ("Failed to stop pipeline\n");
+        g_main_loop_quit (loop);
+      }
+    }
+  }
+  return FALSE;
+}
+
 
 static void
 remove_client (Client * client)
@@ -171,14 +251,15 @@ client_message (Client * client, const gchar * data, guint len)
         g_signal_emit_by_name (multisocketsink, "add", client->socket);
       }
 
-      if (!started) {
+      if (!check_started(pipeline)) {
         g_print ("Starting pipeline\n");
         if (gst_element_set_state (pipeline,
                 GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
           g_print ("Failed to start pipeline\n");
           g_main_loop_quit (loop);
         }
-        started = TRUE;
+        // check if it's time to switch every second
+        g_timeout_add (1000, (GSourceFunc) switch_src, pipeline);
       }
     }
   } else {
@@ -370,6 +451,9 @@ on_client_socket_removed (GstElement * element, GSocket * socket,
 
   if (client)
     remove_client (client);
+
+  // check if pipeline should be paused
+  g_idle_add((GSourceFunc) pause_when_theres_noone, pipeline);
 }
 
 static void on_stream_caps_changed (GObject *obj, GParamSpec *pspec,
@@ -382,7 +466,12 @@ static void on_stream_caps_changed (GObject *obj, GParamSpec *pspec,
 
   src_pad = (GstPad *) obj;
   src_caps = gst_pad_get_current_caps (src_pad);
-  gstrc = gst_caps_get_structure (src_caps, 0);
+  if (src_caps) {
+    gstrc = gst_caps_get_structure (src_caps, 0);
+  } else {
+    g_message("No src caps...\n");
+    return;
+  }
 
   /*
    * Include a Content-type header in the case we know the mime
@@ -440,7 +529,7 @@ int
 main (gint argc, gchar ** argv)
 {
   GSocketService *service;
-  GstElement *bin, *stream;
+  GstElement *bin, *stream, *valve;
   GstPad *srcpad, *ghostpad, *sinkpad;
   GError *err = NULL;
   GstBus *bus;
@@ -471,9 +560,18 @@ main (gint argc, gchar ** argv)
     return -3;
   }
 
+  valve = gst_bin_get_by_name (GST_BIN (bin), "mute");
+  if (!valve) {
+    g_print ("no element with name \"mute\" found\n");
+    gst_object_unref (stream);
+    gst_object_unref (bin);
+    return -3;
+  }
+
   srcpad = gst_element_get_static_pad (stream, "src");
   if (!srcpad) {
     g_print ("no \"src\" pad in element \"stream\" found\n");
+    gst_object_unref (valve);
     gst_object_unref (stream);
     gst_object_unref (bin);
     return -4;
@@ -496,7 +594,7 @@ main (gint argc, gchar ** argv)
       "units-max", (gint64) 7 * GST_SECOND,
       "units-soft-max", (gint64) 3 * GST_SECOND,
       "recover-policy", 3 /* keyframe */ ,
-      "timeout", (guint64) 10 * GST_SECOND,
+      "timeout", (guint64) 20 * GST_SECOND,
       "sync-method", 1 /* next-keyframe */ ,
       NULL);
 
